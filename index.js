@@ -20,6 +20,9 @@ const client = new Client({
 });
 
 const pendingBattles = new Map();
+const spawnCooldowns = new Map();
+
+const SPAWN_COOLDOWN = 60 * 1000;
 
 const categories = {
   common: 1,
@@ -34,7 +37,8 @@ const commands = [
     .setName("addcard")
     .setDescription("Add anime cards")
     .addStringOption(option =>
-      option.setName("category")
+      option
+        .setName("category")
         .setDescription("Card category")
         .setRequired(true)
         .addChoices(
@@ -46,12 +50,14 @@ const commands = [
         )
     )
     .addStringOption(option =>
-      option.setName("character_name")
+      option
+        .setName("character_name")
         .setDescription("Character name")
         .setRequired(true)
     )
     .addStringOption(option =>
-      option.setName("anime_name")
+      option
+        .setName("anime_name")
         .setDescription("Anime name")
         .setRequired(true)
     )
@@ -75,7 +81,8 @@ const commands = [
     .setName("removecard")
     .setDescription("Remove card by character name")
     .addStringOption(option =>
-      option.setName("character_name")
+      option
+        .setName("character_name")
         .setDescription("Character name")
         .setRequired(true)
     ),
@@ -86,7 +93,20 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("cardcollection")
-    .setDescription("Show all cards inside the bot"),
+    .setDescription("Show all cards stored in the bot")
+    .addStringOption(option =>
+      option
+        .setName("category")
+        .setDescription("Choose card category")
+        .setRequired(false)
+        .addChoices(
+          { name: "Common", value: "common" },
+          { name: "Rare", value: "rare" },
+          { name: "Legendary", value: "legendary" },
+          { name: "Mythic", value: "mythic" },
+          { name: "Divine", value: "divine" }
+        )
+    ),
 
   new SlashCommandBuilder()
     .setName("crate")
@@ -94,13 +114,14 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("collection")
-    .setDescription("View your card collection"),
+    .setDescription("View your anime card collection"),
 
   new SlashCommandBuilder()
     .setName("battle")
     .setDescription("Battle another player")
     .addUserOption(option =>
-      option.setName("player")
+      option
+        .setName("player")
         .setDescription("Player to battle")
         .setRequired(true)
     )
@@ -110,7 +131,10 @@ async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 
   await rest.put(
-    Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
+    Routes.applicationGuildCommands(
+      process.env.CLIENT_ID,
+      process.env.GUILD_ID
+    ),
     { body: commands }
   );
 
@@ -189,13 +213,14 @@ client.once("ready", async () => {
 
   setInterval(async () => {
     const channel = await client.channels.fetch(process.env.SPAWN_CHANNEL_ID);
-    if (channel) spawnCard(channel);
+    if (channel) {
+      spawnCard(channel);
+    }
   }, 3 * 60 * 60 * 1000);
 });
 
 client.on("interactionCreate", async interaction => {
   if (interaction.isChatInputCommand()) {
-
     if (interaction.commandName === "addcard") {
       const member = interaction.member;
 
@@ -285,6 +310,20 @@ client.on("interactionCreate", async interaction => {
         });
       }
 
+      const lastSpawn = spawnCooldowns.get(interaction.guild.id);
+      const now = Date.now();
+
+      if (lastSpawn && now - lastSpawn < SPAWN_COOLDOWN) {
+        const remaining = Math.ceil((SPAWN_COOLDOWN - (now - lastSpawn)) / 1000);
+
+        return interaction.reply({
+          content: `⏳ Wait **${remaining} seconds** before spawning again.`,
+          ephemeral: true
+        });
+      }
+
+      spawnCooldowns.set(interaction.guild.id, now);
+
       await interaction.reply({
         content: "✅ Spawning card...",
         ephemeral: true
@@ -294,33 +333,60 @@ client.on("interactionCreate", async interaction => {
     }
 
     if (interaction.commandName === "cardcollection") {
-      const result = await pool.query(`
-        SELECT category, character_name, anime_name
-        FROM cards
-        ORDER BY 
-          CASE category
-            WHEN 'divine' THEN 5
-            WHEN 'mythic' THEN 4
-            WHEN 'legendary' THEN 3
-            WHEN 'rare' THEN 2
-            WHEN 'common' THEN 1
-          END DESC,
-          character_name ASC
-        LIMIT 50
-      `);
+      const category = interaction.options.getString("category");
 
-      if (result.rows.length === 0) {
-        return interaction.reply("❌ No cards are stored in the bot yet.");
+      let result;
+
+      if (category) {
+        result = await pool.query(
+          `
+          SELECT category, character_name, anime_name
+          FROM cards
+          WHERE category = $1
+          ORDER BY character_name ASC
+          LIMIT 10
+          `,
+          [category]
+        );
+      } else {
+        result = await pool.query(`
+          SELECT category, character_name, anime_name
+          FROM cards
+          ORDER BY 
+            CASE category
+              WHEN 'divine' THEN 5
+              WHEN 'mythic' THEN 4
+              WHEN 'legendary' THEN 3
+              WHEN 'rare' THEN 2
+              WHEN 'common' THEN 1
+            END DESC,
+            character_name ASC
+          LIMIT 10
+        `);
       }
 
-      const list = result.rows.map((card, index) =>
-        `**${index + 1}.** ${card.character_name} — ${card.anime_name} | **${card.category.toUpperCase()}**`
-      ).join("\n");
+      if (result.rows.length === 0) {
+        return interaction.reply({
+          content: "❌ No cards found.",
+          ephemeral: true
+        });
+      }
+
+      const list = result.rows
+        .map(
+          (card, index) =>
+            `**${index + 1}.** ${card.character_name} — ${card.anime_name}\nRank: **${card.category.toUpperCase()}**`
+        )
+        .join("\n\n");
 
       const embed = new EmbedBuilder()
-        .setTitle("🎴 Bot Card Collection")
+        .setTitle(
+          category
+            ? `🎴 ${category.toUpperCase()} Cards`
+            : "🎴 Bot Card Collection"
+        )
         .setDescription(list)
-        .setFooter({ text: `Showing ${result.rows.length} cards` })
+        .setFooter({ text: "Showing 10 cards max" })
         .setColor("Blue");
 
       return interaction.reply({ embeds: [embed] });
@@ -395,9 +461,12 @@ client.on("interactionCreate", async interaction => {
         return interaction.reply("You have no cards yet.");
       }
 
-      const list = result.rows.map((card, index) =>
-        `**${index + 1}.** ${card.character_name} — ${card.anime_name} | **${card.category.toUpperCase()}**`
-      ).join("\n");
+      const list = result.rows
+        .map(
+          (card, index) =>
+            `**${index + 1}.** ${card.character_name} — ${card.anime_name} | **${card.category.toUpperCase()}**`
+        )
+        .join("\n");
 
       return interaction.reply({
         embeds: [
@@ -424,10 +493,12 @@ client.on("interactionCreate", async interaction => {
       const opponentCards = await getUserCards(opponent.id);
 
       if (challengerCards.length === 0 || opponentCards.length === 0) {
-        return interaction.reply("❌ Both players need at least one card to battle.");
+        return interaction.reply(
+          "❌ Both players need at least one card to battle."
+        );
       }
 
-      const battleId = `${interaction.user.id}_${opponent.id}_${Date.now()}`;
+      const battleId = `${interaction.user.id}-${opponent.id}-${Date.now()}`;
 
       pendingBattles.set(battleId, {
         challengerId: interaction.user.id,
@@ -443,12 +514,12 @@ client.on("interactionCreate", async interaction => {
 
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
-          .setCustomId(`battle_accept_${battleId}`)
+          .setCustomId(`battleAccept:${battleId}`)
           .setLabel("Accept")
           .setStyle(ButtonStyle.Success),
 
         new ButtonBuilder()
-          .setCustomId(`battle_reject_${battleId}`)
+          .setCustomId(`battleReject:${battleId}`)
           .setLabel("Reject")
           .setStyle(ButtonStyle.Danger)
       );
@@ -476,8 +547,8 @@ client.on("interactionCreate", async interaction => {
       });
     }
 
-    if (interaction.customId.startsWith("battle_reject_")) {
-      const battleId = interaction.customId.replace("battle_reject_", "");
+    if (interaction.customId.startsWith("battleReject:")) {
+      const battleId = interaction.customId.split(":")[1];
       const battle = pendingBattles.get(battleId);
 
       if (!battle) {
@@ -503,8 +574,8 @@ client.on("interactionCreate", async interaction => {
       });
     }
 
-    if (interaction.customId.startsWith("battle_accept_")) {
-      const battleId = interaction.customId.replace("battle_accept_", "");
+    if (interaction.customId.startsWith("battleAccept:")) {
+      const battleId = interaction.customId.split(":")[1];
       const battle = pendingBattles.get(battleId);
 
       if (!battle) {
@@ -525,7 +596,7 @@ client.on("interactionCreate", async interaction => {
       const opponentCards = await getUserCards(battle.opponentId);
 
       const challengerMenu = new StringSelectMenuBuilder()
-        .setCustomId(`selectcard_${battleId}_${battle.challengerId}`)
+        .setCustomId(`selectcard:${battleId}:${battle.challengerId}`)
         .setPlaceholder("Challenger: choose your card")
         .addOptions(
           challengerCards.map(card => ({
@@ -536,7 +607,7 @@ client.on("interactionCreate", async interaction => {
         );
 
       const opponentMenu = new StringSelectMenuBuilder()
-        .setCustomId(`selectcard_${battleId}_${battle.opponentId}`)
+        .setCustomId(`selectcard:${battleId}:${battle.opponentId}`)
         .setPlaceholder("Opponent: choose your card")
         .addOptions(
           opponentCards.map(card => ({
@@ -558,8 +629,8 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.isStringSelectMenu()) {
-    if (interaction.customId.startsWith("selectcard_")) {
-      const parts = interaction.customId.split("_");
+    if (interaction.customId.startsWith("selectcard:")) {
+      const parts = interaction.customId.split(":");
       const battleId = parts[1];
       const allowedUserId = parts[2];
 
@@ -626,9 +697,10 @@ client.on("interactionCreate", async interaction => {
         } else if (opponentPower > challengerPower) {
           winner = `<@${battle.opponentId}>`;
         } else {
-          winner = Math.random() < 0.5
-            ? `<@${battle.challengerId}>`
-            : `<@${battle.opponentId}>`;
+          winner =
+            Math.random() < 0.5
+              ? `<@${battle.challengerId}>`
+              : `<@${battle.opponentId}>`;
         }
 
         const resultEmbed = new EmbedBuilder()
