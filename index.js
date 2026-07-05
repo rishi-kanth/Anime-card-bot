@@ -29,6 +29,15 @@ const categories = {
 
 const commands = [
   new SlashCommandBuilder()
+  .setName("removecard")
+  .setDescription("Remove an anime card by character name")
+  .addStringOption(option =>
+    option
+      .setName("character_name")
+      .setDescription("Character name to remove")
+      .setRequired(true)
+  ),
+  new SlashCommandBuilder()
     .setName("addcard")
     .setDescription("Add anime cards")
     .addStringOption(option =>
@@ -180,6 +189,7 @@ client.once("ready", async () => {
 
   setInterval(spawnCard, 3 * 60 * 60 * 1000);
 });
+
 client.on("interactionCreate", async interaction => {
   if (interaction.isChatInputCommand()) {
     if (interaction.commandName === "addcard") {
@@ -214,6 +224,49 @@ client.on("interactionCreate", async interaction => {
 
       return interaction.reply({
         content: `✅ Added **${images.length}** card(s) successfully.`,
+        ephemeral: true
+      });
+    }
+
+    if (interaction.commandName === "removecard") {
+      const member = interaction.member;
+
+      if (!member.roles.cache.has(process.env.UPLOAD_ROLE_ID)) {
+        return interaction.reply({
+          content: "❌ You do not have permission to remove cards.",
+          ephemeral: true
+        });
+      }
+
+      const characterName = interaction.options.getString("character_name");
+
+      const result = await pool.query(
+        `SELECT * FROM cards WHERE LOWER(character_name) = LOWER($1)`,
+        [characterName]
+      );
+
+      if (result.rows.length === 0) {
+        return interaction.reply({
+          content: `❌ No card found with name **${characterName}**.`,
+          ephemeral: true
+        });
+      }
+
+      await pool.query(
+        `DELETE FROM user_cards 
+         WHERE card_id IN (
+           SELECT id FROM cards WHERE LOWER(character_name) = LOWER($1)
+         )`,
+        [characterName]
+      );
+
+      await pool.query(
+        `DELETE FROM cards WHERE LOWER(character_name) = LOWER($1)`,
+        [characterName]
+      );
+
+      return interaction.reply({
+        content: `✅ Removed **${result.rows.length}** card(s) named **${characterName}**.`,
         ephemeral: true
       });
     }
