@@ -10,7 +10,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  PermissionFlagsBits
+  StringSelectMenuBuilder
 } = require("discord.js");
 
 const { pool, initDatabase } = require("./database");
@@ -18,6 +18,8 @@ const { pool, initDatabase } = require("./database");
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
+
+const pendingBattles = new Map();
 
 const categories = {
   common: 1,
@@ -29,20 +31,10 @@ const categories = {
 
 const commands = [
   new SlashCommandBuilder()
-  .setName("removecard")
-  .setDescription("Remove an anime card by character name")
-  .addStringOption(option =>
-    option
-      .setName("character_name")
-      .setDescription("Character name to remove")
-      .setRequired(true)
-  ),
-  new SlashCommandBuilder()
     .setName("addcard")
     .setDescription("Add anime cards")
     .addStringOption(option =>
-      option
-        .setName("category")
+      option.setName("category")
         .setDescription("Card category")
         .setRequired(true)
         .addChoices(
@@ -54,47 +46,47 @@ const commands = [
         )
     )
     .addStringOption(option =>
-      option
-        .setName("character_name")
+      option.setName("character_name")
         .setDescription("Character name")
         .setRequired(true)
     )
     .addStringOption(option =>
-      option
-        .setName("anime_name")
+      option.setName("anime_name")
         .setDescription("Anime name")
         .setRequired(true)
     )
     .addAttachmentOption(option =>
-      option
-        .setName("image1")
-        .setDescription("Card image 1")
-        .setRequired(true)
+      option.setName("image1").setDescription("Card image 1").setRequired(true)
     )
     .addAttachmentOption(option =>
-      option
-        .setName("image2")
-        .setDescription("Card image 2")
-        .setRequired(false)
+      option.setName("image2").setDescription("Card image 2").setRequired(false)
     )
     .addAttachmentOption(option =>
-      option
-        .setName("image3")
-        .setDescription("Card image 3")
-        .setRequired(false)
+      option.setName("image3").setDescription("Card image 3").setRequired(false)
     )
     .addAttachmentOption(option =>
-      option
-        .setName("image4")
-        .setDescription("Card image 4")
-        .setRequired(false)
+      option.setName("image4").setDescription("Card image 4").setRequired(false)
     )
     .addAttachmentOption(option =>
-      option
-        .setName("image5")
-        .setDescription("Card image 5")
-        .setRequired(false)
+      option.setName("image5").setDescription("Card image 5").setRequired(false)
     ),
+
+  new SlashCommandBuilder()
+    .setName("removecard")
+    .setDescription("Remove card by character name")
+    .addStringOption(option =>
+      option.setName("character_name")
+        .setDescription("Character name")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("spawn")
+    .setDescription("Manually spawn a random anime card"),
+
+  new SlashCommandBuilder()
+    .setName("cardcollection")
+    .setDescription("Show all cards inside the bot"),
 
   new SlashCommandBuilder()
     .setName("crate")
@@ -102,14 +94,13 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("collection")
-    .setDescription("View your anime card collection"),
+    .setDescription("View your card collection"),
 
   new SlashCommandBuilder()
     .setName("battle")
     .setDescription("Battle another player")
     .addUserOption(option =>
-      option
-        .setName("player")
+      option.setName("player")
         .setDescription("Player to battle")
         .setRequired(true)
     )
@@ -119,10 +110,7 @@ async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 
   await rest.put(
-    Routes.applicationGuildCommands(
-      process.env.CLIENT_ID,
-      process.env.GUILD_ID
-    ),
+    Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
     { body: commands }
   );
 
@@ -147,15 +135,11 @@ async function giveCard(userId, cardId) {
   );
 }
 
-async function spawnCard() {
-  const channel = await client.channels.fetch(process.env.SPAWN_CHANNEL_ID);
-  if (!channel) return;
-
+async function spawnCard(channel) {
   const card = await getRandomCard();
 
   if (!card) {
-    console.log("No cards found.");
-    return;
+    return channel.send("❌ No cards are available yet.");
   }
 
   const embed = new EmbedBuilder()
@@ -166,7 +150,7 @@ async function spawnCard() {
       `**Rank:** ${card.category.toUpperCase()}`
     )
     .setImage(card.image_url)
-    .setColor("Random");
+    .setColor("Purple");
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -181,17 +165,37 @@ async function spawnCard() {
   });
 }
 
+async function getUserCards(userId) {
+  const result = await pool.query(
+    `
+    SELECT user_cards.id AS user_card_id, cards.*
+    FROM user_cards
+    JOIN cards ON user_cards.card_id = cards.id
+    WHERE user_cards.user_id = $1
+    ORDER BY user_cards.obtained_at DESC
+    LIMIT 25
+    `,
+    [userId]
+  );
+
+  return result.rows;
+}
+
 client.once("ready", async () => {
   console.log(`${client.user.tag} is online.`);
 
   await initDatabase();
   await registerCommands();
 
-  setInterval(spawnCard, 3 * 60 * 60 * 1000);
+  setInterval(async () => {
+    const channel = await client.channels.fetch(process.env.SPAWN_CHANNEL_ID);
+    if (channel) spawnCard(channel);
+  }, 3 * 60 * 60 * 1000);
 });
 
 client.on("interactionCreate", async interaction => {
   if (interaction.isChatInputCommand()) {
+
     if (interaction.commandName === "addcard") {
       const member = interaction.member;
 
@@ -247,7 +251,7 @@ client.on("interactionCreate", async interaction => {
 
       if (result.rows.length === 0) {
         return interaction.reply({
-          content: `❌ No card found with name **${characterName}**.`,
+          content: `❌ No card found named **${characterName}**.`,
           ephemeral: true
         });
       }
@@ -269,6 +273,57 @@ client.on("interactionCreate", async interaction => {
         content: `✅ Removed **${result.rows.length}** card(s) named **${characterName}**.`,
         ephemeral: true
       });
+    }
+
+    if (interaction.commandName === "spawn") {
+      const member = interaction.member;
+
+      if (!member.roles.cache.has(process.env.UPLOAD_ROLE_ID)) {
+        return interaction.reply({
+          content: "❌ You do not have permission to spawn cards.",
+          ephemeral: true
+        });
+      }
+
+      await interaction.reply({
+        content: "✅ Spawning card...",
+        ephemeral: true
+      });
+
+      return spawnCard(interaction.channel);
+    }
+
+    if (interaction.commandName === "cardcollection") {
+      const result = await pool.query(`
+        SELECT category, character_name, anime_name
+        FROM cards
+        ORDER BY 
+          CASE category
+            WHEN 'divine' THEN 5
+            WHEN 'mythic' THEN 4
+            WHEN 'legendary' THEN 3
+            WHEN 'rare' THEN 2
+            WHEN 'common' THEN 1
+          END DESC,
+          character_name ASC
+        LIMIT 50
+      `);
+
+      if (result.rows.length === 0) {
+        return interaction.reply("❌ No cards are stored in the bot yet.");
+      }
+
+      const list = result.rows.map((card, index) =>
+        `**${index + 1}.** ${card.character_name} — ${card.anime_name} | **${card.category.toUpperCase()}**`
+      ).join("\n");
+
+      const embed = new EmbedBuilder()
+        .setTitle("🎴 Bot Card Collection")
+        .setDescription(list)
+        .setFooter({ text: `Showing ${result.rows.length} cards` })
+        .setColor("Blue");
+
+      return interaction.reply({ embeds: [embed] });
     }
 
     if (interaction.commandName === "crate") {
@@ -340,12 +395,9 @@ client.on("interactionCreate", async interaction => {
         return interaction.reply("You have no cards yet.");
       }
 
-      const list = result.rows
-        .map(
-          (card, index) =>
-            `**${index + 1}.** ${card.character_name} — ${card.anime_name} | **${card.category.toUpperCase()}**`
-        )
-        .join("\n");
+      const list = result.rows.map((card, index) =>
+        `**${index + 1}.** ${card.character_name} — ${card.anime_name} | **${card.category.toUpperCase()}**`
+      ).join("\n");
 
       return interaction.reply({
         embeds: [
@@ -368,21 +420,35 @@ client.on("interactionCreate", async interaction => {
         return interaction.reply("❌ You cannot battle yourself.");
       }
 
+      const challengerCards = await getUserCards(interaction.user.id);
+      const opponentCards = await getUserCards(opponent.id);
+
+      if (challengerCards.length === 0 || opponentCards.length === 0) {
+        return interaction.reply("❌ Both players need at least one card to battle.");
+      }
+
+      const battleId = `${interaction.user.id}_${opponent.id}_${Date.now()}`;
+
+      pendingBattles.set(battleId, {
+        challengerId: interaction.user.id,
+        opponentId: opponent.id,
+        challengerCard: null,
+        opponentCard: null
+      });
+
       const embed = new EmbedBuilder()
         .setTitle("⚔️ Battle Request")
-        .setDescription(
-          `${interaction.user} challenged ${opponent} to a card battle!`
-        )
+        .setDescription(`${interaction.user} challenged ${opponent} to a battle!`)
         .setColor("Red");
 
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
-          .setCustomId(`battle_accept_${interaction.user.id}_${opponent.id}`)
+          .setCustomId(`battle_accept_${battleId}`)
           .setLabel("Accept")
           .setStyle(ButtonStyle.Success),
 
         new ButtonBuilder()
-          .setCustomId(`battle_reject_${interaction.user.id}_${opponent.id}`)
+          .setCustomId(`battle_reject_${battleId}`)
           .setLabel("Reject")
           .setStyle(ButtonStyle.Danger)
       );
@@ -404,103 +470,182 @@ client.on("interactionCreate", async interaction => {
         ButtonBuilder.from(interaction.component).setDisabled(true)
       );
 
-      await interaction.update({
+      return interaction.update({
         content: `✅ ${interaction.user} claimed the card!`,
         components: [disabledRow]
       });
     }
 
-    if (interaction.customId.startsWith("battle_accept_")) {
-      const [, , challengerId, opponentId] = interaction.customId.split("_");
+    if (interaction.customId.startsWith("battle_reject_")) {
+      const battleId = interaction.customId.replace("battle_reject_", "");
+      const battle = pendingBattles.get(battleId);
 
-      if (interaction.user.id !== opponentId) {
+      if (!battle) {
         return interaction.reply({
-          content: "❌ Only the challenged player can accept this battle.",
+          content: "❌ This battle expired.",
           ephemeral: true
         });
       }
 
-      const challengerCardResult = await pool.query(
-        `
-        SELECT cards.*
-        FROM user_cards
-        JOIN cards ON user_cards.card_id = cards.id
-        WHERE user_cards.user_id = $1
-        ORDER BY RANDOM()
-        LIMIT 1
-        `,
-        [challengerId]
-      );
-
-      const opponentCardResult = await pool.query(
-        `
-        SELECT cards.*
-        FROM user_cards
-        JOIN cards ON user_cards.card_id = cards.id
-        WHERE user_cards.user_id = $1
-        ORDER BY RANDOM()
-        LIMIT 1
-        `,
-        [opponentId]
-      );
-
-      if (
-        challengerCardResult.rows.length === 0 ||
-        opponentCardResult.rows.length === 0
-      ) {
-        return interaction.update({
-          content: "❌ Both players need at least one card to battle.",
-          embeds: [],
-          components: []
+      if (interaction.user.id !== battle.opponentId) {
+        return interaction.reply({
+          content: "❌ Only the challenged player can reject.",
+          ephemeral: true
         });
       }
 
-      const challengerCard = challengerCardResult.rows[0];
-      const opponentCard = opponentCardResult.rows[0];
-
-      const challengerPower = categories[challengerCard.category];
-      const opponentPower = categories[opponentCard.category];
-
-      let winner;
-
-      if (challengerPower > opponentPower) {
-        winner = `<@${challengerId}>`;
-      } else if (opponentPower > challengerPower) {
-        winner = `<@${opponentId}>`;
-      } else {
-        winner = Math.random() < 0.5 ? `<@${challengerId}>` : `<@${opponentId}>`;
-      }
-
-      const resultEmbed = new EmbedBuilder()
-        .setTitle("⚔️ Battle Result")
-        .setDescription(
-          `<@${challengerId}> used **${challengerCard.character_name}** | **${challengerCard.category.toUpperCase()}**\n\n` +
-          `<@${opponentId}> used **${opponentCard.character_name}** | **${opponentCard.category.toUpperCase()}**\n\n` +
-          `🏆 Winner: ${winner}`
-        )
-        .setColor("Purple");
+      pendingBattles.delete(battleId);
 
       return interaction.update({
-        embeds: [resultEmbed],
+        content: "❌ Battle rejected.",
+        embeds: [],
         components: []
       });
     }
 
-    if (interaction.customId.startsWith("battle_reject_")) {
-      const [, , challengerId, opponentId] = interaction.customId.split("_");
+    if (interaction.customId.startsWith("battle_accept_")) {
+      const battleId = interaction.customId.replace("battle_accept_", "");
+      const battle = pendingBattles.get(battleId);
 
-      if (interaction.user.id !== opponentId) {
+      if (!battle) {
         return interaction.reply({
-          content: "❌ Only the challenged player can reject this battle.",
+          content: "❌ This battle expired.",
           ephemeral: true
         });
       }
 
+      if (interaction.user.id !== battle.opponentId) {
+        return interaction.reply({
+          content: "❌ Only the challenged player can accept.",
+          ephemeral: true
+        });
+      }
+
+      const challengerCards = await getUserCards(battle.challengerId);
+      const opponentCards = await getUserCards(battle.opponentId);
+
+      const challengerMenu = new StringSelectMenuBuilder()
+        .setCustomId(`selectcard_${battleId}_${battle.challengerId}`)
+        .setPlaceholder("Challenger: choose your card")
+        .addOptions(
+          challengerCards.map(card => ({
+            label: card.character_name.slice(0, 100),
+            description: `${card.anime_name} | ${card.category.toUpperCase()}`.slice(0, 100),
+            value: String(card.user_card_id)
+          }))
+        );
+
+      const opponentMenu = new StringSelectMenuBuilder()
+        .setCustomId(`selectcard_${battleId}_${battle.opponentId}`)
+        .setPlaceholder("Opponent: choose your card")
+        .addOptions(
+          opponentCards.map(card => ({
+            label: card.character_name.slice(0, 100),
+            description: `${card.anime_name} | ${card.category.toUpperCase()}`.slice(0, 100),
+            value: String(card.user_card_id)
+          }))
+        );
+
       return interaction.update({
-        content: `❌ <@${opponentId}> rejected the battle.`,
+        content: `⚔️ Battle accepted!\n<@${battle.challengerId}> and <@${battle.opponentId}>, choose your cards.`,
         embeds: [],
-        components: []
+        components: [
+          new ActionRowBuilder().addComponents(challengerMenu),
+          new ActionRowBuilder().addComponents(opponentMenu)
+        ]
       });
+    }
+  }
+
+  if (interaction.isStringSelectMenu()) {
+    if (interaction.customId.startsWith("selectcard_")) {
+      const parts = interaction.customId.split("_");
+      const battleId = parts[1];
+      const allowedUserId = parts[2];
+
+      if (interaction.user.id !== allowedUserId) {
+        return interaction.reply({
+          content: "❌ This card menu is not for you.",
+          ephemeral: true
+        });
+      }
+
+      const battle = pendingBattles.get(battleId);
+
+      if (!battle) {
+        return interaction.reply({
+          content: "❌ This battle expired.",
+          ephemeral: true
+        });
+      }
+
+      const userCardId = interaction.values[0];
+
+      const cardResult = await pool.query(
+        `
+        SELECT user_cards.id AS user_card_id, cards.*
+        FROM user_cards
+        JOIN cards ON user_cards.card_id = cards.id
+        WHERE user_cards.id = $1 AND user_cards.user_id = $2
+        `,
+        [userCardId, interaction.user.id]
+      );
+
+      if (cardResult.rows.length === 0) {
+        return interaction.reply({
+          content: "❌ Card not found.",
+          ephemeral: true
+        });
+      }
+
+      const selectedCard = cardResult.rows[0];
+
+      if (interaction.user.id === battle.challengerId) {
+        battle.challengerCard = selectedCard;
+      }
+
+      if (interaction.user.id === battle.opponentId) {
+        battle.opponentCard = selectedCard;
+      }
+
+      pendingBattles.set(battleId, battle);
+
+      await interaction.reply({
+        content: `✅ You selected **${selectedCard.character_name}**.`,
+        ephemeral: true
+      });
+
+      if (battle.challengerCard && battle.opponentCard) {
+        const challengerPower = categories[battle.challengerCard.category];
+        const opponentPower = categories[battle.opponentCard.category];
+
+        let winner;
+
+        if (challengerPower > opponentPower) {
+          winner = `<@${battle.challengerId}>`;
+        } else if (opponentPower > challengerPower) {
+          winner = `<@${battle.opponentId}>`;
+        } else {
+          winner = Math.random() < 0.5
+            ? `<@${battle.challengerId}>`
+            : `<@${battle.opponentId}>`;
+        }
+
+        const resultEmbed = new EmbedBuilder()
+          .setTitle("⚔️ Battle Result")
+          .setDescription(
+            `<@${battle.challengerId}> used **${battle.challengerCard.character_name}** | **${battle.challengerCard.category.toUpperCase()}**\n\n` +
+            `<@${battle.opponentId}> used **${battle.opponentCard.character_name}** | **${battle.opponentCard.category.toUpperCase()}**\n\n` +
+            `🏆 Winner: ${winner}`
+          )
+          .setColor("Purple");
+
+        pendingBattles.delete(battleId);
+
+        await interaction.channel.send({
+          embeds: [resultEmbed]
+        });
+      }
     }
   }
 });
