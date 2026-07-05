@@ -21,8 +21,10 @@ const client = new Client({
 
 const pendingBattles = new Map();
 const spawnCooldowns = new Map();
+const cardCollectionSessions = new Map();
 
 const SPAWN_COOLDOWN = 60 * 1000;
+const CARD_LIMIT = 10;
 
 const categories = {
   common: 1,
@@ -37,8 +39,7 @@ const commands = [
     .setName("addcard")
     .setDescription("Add anime cards")
     .addStringOption(option =>
-      option
-        .setName("category")
+      option.setName("category")
         .setDescription("Card category")
         .setRequired(true)
         .addChoices(
@@ -50,14 +51,12 @@ const commands = [
         )
     )
     .addStringOption(option =>
-      option
-        .setName("character_name")
+      option.setName("character_name")
         .setDescription("Character name")
         .setRequired(true)
     )
     .addStringOption(option =>
-      option
-        .setName("anime_name")
+      option.setName("anime_name")
         .setDescription("Anime name")
         .setRequired(true)
     )
@@ -81,8 +80,7 @@ const commands = [
     .setName("removecard")
     .setDescription("Remove card by character name")
     .addStringOption(option =>
-      option
-        .setName("character_name")
+      option.setName("character_name")
         .setDescription("Character name")
         .setRequired(true)
     ),
@@ -93,20 +91,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("cardcollection")
-    .setDescription("Show all cards stored in the bot")
-    .addStringOption(option =>
-      option
-        .setName("category")
-        .setDescription("Choose card category")
-        .setRequired(false)
-        .addChoices(
-          { name: "Common", value: "common" },
-          { name: "Rare", value: "rare" },
-          { name: "Legendary", value: "legendary" },
-          { name: "Mythic", value: "mythic" },
-          { name: "Divine", value: "divine" }
-        )
-    ),
+    .setDescription("Show all cards stored in the bot"),
 
   new SlashCommandBuilder()
     .setName("crate")
@@ -120,8 +105,7 @@ const commands = [
     .setName("battle")
     .setDescription("Battle another player")
     .addUserOption(option =>
-      option
-        .setName("player")
+      option.setName("player")
         .setDescription("Player to battle")
         .setRequired(true)
     )
@@ -131,10 +115,7 @@ async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 
   await rest.put(
-    Routes.applicationGuildCommands(
-      process.env.CLIENT_ID,
-      process.env.GUILD_ID
-    ),
+    Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
     { body: commands }
   );
 
@@ -203,6 +184,118 @@ async function getUserCards(userId) {
   );
 
   return result.rows;
+}
+
+async function getCardCollectionEmbed(category, page) {
+  const offset = page * CARD_LIMIT;
+
+  const countResult = await pool.query(
+    `SELECT COUNT(*) FROM cards WHERE category = $1`,
+    [category]
+  );
+
+  const totalCards = Number(countResult.rows[0].count);
+  const totalPages = Math.max(1, Math.ceil(totalCards / CARD_LIMIT));
+
+  const result = await pool.query(
+    `
+    SELECT category, character_name, anime_name
+    FROM cards
+    WHERE category = $1
+    ORDER BY character_name ASC
+    LIMIT $2 OFFSET $3
+    `,
+    [category, CARD_LIMIT, offset]
+  );
+
+  let list = "No cards found in this category.";
+
+  if (result.rows.length > 0) {
+    list = result.rows.map((card, index) => {
+      const number = offset + index + 1;
+
+      return (
+        `**${number}. ${card.character_name}**\n` +
+        `Anime: ${card.anime_name}\n` +
+        `Rank: **${card.category.toUpperCase()}**`
+      );
+    }).join("\n\n");
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle("🎴 Bot Card Collection")
+    .setDescription(
+      `**Category:** ${category.toUpperCase()}\n` +
+      `**Cards:** ${totalCards}\n` +
+      `**Page:** ${page + 1}/${totalPages}\n\n` +
+      list
+    )
+    .setColor("Blue")
+    .setFooter({ text: "Use the category menu and buttons below" });
+
+  return { embed, totalPages };
+}
+
+function getCardCollectionComponents(sessionId, category, page, totalPages) {
+  const categoryMenu = new StringSelectMenuBuilder()
+    .setCustomId(`cardCategory:${sessionId}`)
+    .setPlaceholder("Choose a category")
+    .addOptions(
+      {
+        label: "Common",
+        value: "common",
+        description: "View common cards",
+        emoji: "⚪",
+        default: category === "common"
+      },
+      {
+        label: "Rare",
+        value: "rare",
+        description: "View rare cards",
+        emoji: "🔵",
+        default: category === "rare"
+      },
+      {
+        label: "Legendary",
+        value: "legendary",
+        description: "View legendary cards",
+        emoji: "🟡",
+        default: category === "legendary"
+      },
+      {
+        label: "Mythic",
+        value: "mythic",
+        description: "View mythic cards",
+        emoji: "🟣",
+        default: category === "mythic"
+      },
+      {
+        label: "Divine",
+        value: "divine",
+        description: "View divine cards",
+        emoji: "🔴",
+        default: category === "divine"
+      }
+    );
+
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`cardPrev:${sessionId}`)
+      .setLabel("Previous")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 0),
+
+    new ButtonBuilder()
+      .setCustomId(`cardNext:${sessionId}`)
+      .setLabel("Next")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(page + 1 >= totalPages)
+  );
+
+  return [
+    new ActionRowBuilder().addComponents(categoryMenu),
+    buttons
+  ];
 }
 
 client.once("ready", async () => {
@@ -333,63 +426,23 @@ client.on("interactionCreate", async interaction => {
     }
 
     if (interaction.commandName === "cardcollection") {
-      const category = interaction.options.getString("category");
+      const sessionId = `${interaction.user.id}-${Date.now()}`;
+      const category = "divine";
+      const page = 0;
 
-      let result;
+      cardCollectionSessions.set(sessionId, {
+        userId: interaction.user.id,
+        category,
+        page
+      });
 
-      if (category) {
-        result = await pool.query(
-          `
-          SELECT category, character_name, anime_name
-          FROM cards
-          WHERE category = $1
-          ORDER BY character_name ASC
-          LIMIT 10
-          `,
-          [category]
-        );
-      } else {
-        result = await pool.query(`
-          SELECT category, character_name, anime_name
-          FROM cards
-          ORDER BY 
-            CASE category
-              WHEN 'divine' THEN 5
-              WHEN 'mythic' THEN 4
-              WHEN 'legendary' THEN 3
-              WHEN 'rare' THEN 2
-              WHEN 'common' THEN 1
-            END DESC,
-            character_name ASC
-          LIMIT 10
-        `);
-      }
+      const { embed, totalPages } = await getCardCollectionEmbed(category, page);
+      const components = getCardCollectionComponents(sessionId, category, page, totalPages);
 
-      if (result.rows.length === 0) {
-        return interaction.reply({
-          content: "❌ No cards found.",
-          ephemeral: true
-        });
-      }
-
-      const list = result.rows
-        .map(
-          (card, index) =>
-            `**${index + 1}.** ${card.character_name} — ${card.anime_name}\nRank: **${card.category.toUpperCase()}**`
-        )
-        .join("\n\n");
-
-      const embed = new EmbedBuilder()
-        .setTitle(
-          category
-            ? `🎴 ${category.toUpperCase()} Cards`
-            : "🎴 Bot Card Collection"
-        )
-        .setDescription(list)
-        .setFooter({ text: "Showing 10 cards max" })
-        .setColor("Blue");
-
-      return interaction.reply({ embeds: [embed] });
+      return interaction.reply({
+        embeds: [embed],
+        components
+      });
     }
 
     if (interaction.commandName === "crate") {
@@ -493,9 +546,7 @@ client.on("interactionCreate", async interaction => {
       const opponentCards = await getUserCards(opponent.id);
 
       if (challengerCards.length === 0 || opponentCards.length === 0) {
-        return interaction.reply(
-          "❌ Both players need at least one card to battle."
-        );
+        return interaction.reply("❌ Both players need at least one card to battle.");
       }
 
       const battleId = `${interaction.user.id}-${opponent.id}-${Date.now()}`;
@@ -544,6 +595,54 @@ client.on("interactionCreate", async interaction => {
       return interaction.update({
         content: `✅ ${interaction.user} claimed the card!`,
         components: [disabledRow]
+      });
+    }
+
+    if (interaction.customId.startsWith("cardPrev:") || interaction.customId.startsWith("cardNext:")) {
+      const sessionId = interaction.customId.split(":")[1];
+      const session = cardCollectionSessions.get(sessionId);
+
+      if (!session) {
+        return interaction.reply({
+          content: "❌ This card collection menu expired.",
+          ephemeral: true
+        });
+      }
+
+      if (interaction.user.id !== session.userId) {
+        return interaction.reply({
+          content: "❌ This menu is not for you.",
+          ephemeral: true
+        });
+      }
+
+      if (interaction.customId.startsWith("cardPrev:")) {
+        session.page = Math.max(0, session.page - 1);
+      }
+
+      if (interaction.customId.startsWith("cardNext:")) {
+        session.page += 1;
+      }
+
+      const { embed, totalPages } = await getCardCollectionEmbed(session.category, session.page);
+
+      if (session.page >= totalPages) {
+        session.page = totalPages - 1;
+      }
+
+      cardCollectionSessions.set(sessionId, session);
+
+      const fixed = await getCardCollectionEmbed(session.category, session.page);
+      const components = getCardCollectionComponents(
+        sessionId,
+        session.category,
+        session.page,
+        fixed.totalPages
+      );
+
+      return interaction.update({
+        embeds: [fixed.embed],
+        components
       });
     }
 
@@ -629,6 +728,43 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.isStringSelectMenu()) {
+    if (interaction.customId.startsWith("cardCategory:")) {
+      const sessionId = interaction.customId.split(":")[1];
+      const session = cardCollectionSessions.get(sessionId);
+
+      if (!session) {
+        return interaction.reply({
+          content: "❌ This card collection menu expired.",
+          ephemeral: true
+        });
+      }
+
+      if (interaction.user.id !== session.userId) {
+        return interaction.reply({
+          content: "❌ This menu is not for you.",
+          ephemeral: true
+        });
+      }
+
+      session.category = interaction.values[0];
+      session.page = 0;
+
+      cardCollectionSessions.set(sessionId, session);
+
+      const { embed, totalPages } = await getCardCollectionEmbed(session.category, session.page);
+      const components = getCardCollectionComponents(
+        sessionId,
+        session.category,
+        session.page,
+        totalPages
+      );
+
+      return interaction.update({
+        embeds: [embed],
+        components
+      });
+    }
+
     if (interaction.customId.startsWith("selectcard:")) {
       const parts = interaction.customId.split(":");
       const battleId = parts[1];
@@ -697,10 +833,9 @@ client.on("interactionCreate", async interaction => {
         } else if (opponentPower > challengerPower) {
           winner = `<@${battle.opponentId}>`;
         } else {
-          winner =
-            Math.random() < 0.5
-              ? `<@${battle.challengerId}>`
-              : `<@${battle.opponentId}>`;
+          winner = Math.random() < 0.5
+            ? `<@${battle.challengerId}>`
+            : `<@${battle.opponentId}>`;
         }
 
         const resultEmbed = new EmbedBuilder()
