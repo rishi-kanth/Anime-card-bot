@@ -20,10 +20,9 @@ const client = new Client({
 });
 
 const pendingBattles = new Map();
-const spawnCooldowns = new Map();
+const pendingTrades = new Map();
 const cardCollectionSessions = new Map();
 
-const SPAWN_COOLDOWN = 60 * 1000;
 const CARD_LIMIT = 10;
 
 const categories = {
@@ -86,10 +85,6 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
-    .setName("spawn")
-    .setDescription("Manually spawn a random anime card"),
-
-  new SlashCommandBuilder()
     .setName("cardcollection")
     .setDescription("Show all cards stored in the bot"),
 
@@ -108,6 +103,15 @@ const commands = [
       option.setName("player")
         .setDescription("Player to battle")
         .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("trade")
+    .setDescription("Trade/give one of your cards to another user")
+    .addUserOption(option =>
+      option.setName("user")
+        .setDescription("User to trade with")
+        .setRequired(true)
     )
 ].map(command => command.toJSON());
 
@@ -120,6 +124,23 @@ async function registerCommands() {
   );
 
   console.log("Slash commands registered.");
+}
+
+async function saveCardImage(attachment) {
+  if (!process.env.CARD_IMAGE_CHANNEL_ID) {
+    return attachment.proxyURL || attachment.url;
+  }
+
+  const storageChannel = await client.channels.fetch(process.env.CARD_IMAGE_CHANNEL_ID);
+
+  const sent = await storageChannel.send({
+    content: `Stored card image: ${attachment.name}`,
+    files: [attachment.url]
+  });
+
+  const storedAttachment = sent.attachments.first();
+
+  return storedAttachment ? storedAttachment.url : attachment.proxyURL || attachment.url;
 }
 
 async function getRandomCard() {
@@ -186,6 +207,19 @@ async function getUserCards(userId) {
   return result.rows;
 }
 
+function makeCardSelect(cards, customId, placeholder) {
+  return new StringSelectMenuBuilder()
+    .setCustomId(customId)
+    .setPlaceholder(placeholder)
+    .addOptions(
+      cards.map(card => ({
+        label: card.character_name.slice(0, 100),
+        description: `${card.anime_name} | ${card.category.toUpperCase()}`.slice(0, 100),
+        value: String(card.user_card_id)
+      }))
+    );
+}
+
 async function getCardCollectionEmbed(category, page) {
   const offset = page * CARD_LIMIT;
 
@@ -199,7 +233,7 @@ async function getCardCollectionEmbed(category, page) {
 
   const result = await pool.query(
     `
-    SELECT category, character_name, anime_name
+    SELECT category, character_name, anime_name, image_url
     FROM cards
     WHERE category = $1
     ORDER BY character_name ASC
@@ -233,6 +267,10 @@ async function getCardCollectionEmbed(category, page) {
     .setColor("Blue")
     .setFooter({ text: "Use the category menu and buttons below" });
 
+  if (result.rows[0]?.image_url) {
+    embed.setThumbnail(result.rows[0].image_url);
+  }
+
   return { embed, totalPages };
 }
 
@@ -241,41 +279,11 @@ function getCardCollectionComponents(sessionId, category, page, totalPages) {
     .setCustomId(`cardCategory:${sessionId}`)
     .setPlaceholder("Choose a category")
     .addOptions(
-      {
-        label: "Common",
-        value: "common",
-        description: "View common cards",
-        emoji: "⚪",
-        default: category === "common"
-      },
-      {
-        label: "Rare",
-        value: "rare",
-        description: "View rare cards",
-        emoji: "🔵",
-        default: category === "rare"
-      },
-      {
-        label: "Legendary",
-        value: "legendary",
-        description: "View legendary cards",
-        emoji: "🟡",
-        default: category === "legendary"
-      },
-      {
-        label: "Mythic",
-        value: "mythic",
-        description: "View mythic cards",
-        emoji: "🟣",
-        default: category === "mythic"
-      },
-      {
-        label: "Divine",
-        value: "divine",
-        description: "View divine cards",
-        emoji: "🔴",
-        default: category === "divine"
-      }
+      { label: "Common", value: "common", emoji: "⚪", default: category === "common" },
+      { label: "Rare", value: "rare", emoji: "🔵", default: category === "rare" },
+      { label: "Legendary", value: "legendary", emoji: "🟡", default: category === "legendary" },
+      { label: "Mythic", value: "mythic", emoji: "🟣", default: category === "mythic" },
+      { label: "Divine", value: "divine", emoji: "🔴", default: category === "divine" }
     );
 
   const buttons = new ActionRowBuilder().addComponents(
@@ -324,6 +332,8 @@ client.on("interactionCreate", async interaction => {
         });
       }
 
+      await interaction.deferReply({ ephemeral: true });
+
       const category = interaction.options.getString("category");
       const characterName = interaction.options.getString("character_name");
       const animeName = interaction.options.getString("anime_name");
@@ -332,7 +342,10 @@ client.on("interactionCreate", async interaction => {
 
       for (let i = 1; i <= 5; i++) {
         const image = interaction.options.getAttachment(`image${i}`);
-        if (image) images.push(image.url);
+        if (image) {
+          const savedUrl = await saveCardImage(image);
+          images.push(savedUrl);
+        }
       }
 
       for (const imageUrl of images) {
@@ -344,9 +357,8 @@ client.on("interactionCreate", async interaction => {
         );
       }
 
-      return interaction.reply({
-        content: `✅ Added **${images.length}** card(s) successfully.`,
-        ephemeral: true
+      return interaction.editReply({
+        content: `✅ Added **${images.length}** card(s) successfully.`
       });
     }
 
@@ -391,38 +403,6 @@ client.on("interactionCreate", async interaction => {
         content: `✅ Removed **${result.rows.length}** card(s) named **${characterName}**.`,
         ephemeral: true
       });
-    }
-
-    if (interaction.commandName === "spawn") {
-      const member = interaction.member;
-
-      if (!member.roles.cache.has(process.env.UPLOAD_ROLE_ID)) {
-        return interaction.reply({
-          content: "❌ You do not have permission to spawn cards.",
-          ephemeral: true
-        });
-      }
-
-      const lastSpawn = spawnCooldowns.get(interaction.guild.id);
-      const now = Date.now();
-
-      if (lastSpawn && now - lastSpawn < SPAWN_COOLDOWN) {
-        const remaining = Math.ceil((SPAWN_COOLDOWN - (now - lastSpawn)) / 1000);
-
-        return interaction.reply({
-          content: `⏳ Wait **${remaining} seconds** before spawning again.`,
-          ephemeral: true
-        });
-      }
-
-      spawnCooldowns.set(interaction.guild.id, now);
-
-      await interaction.reply({
-        content: "✅ Spawning card...",
-        ephemeral: true
-      });
-
-      return spawnCard(interaction.channel);
     }
 
     if (interaction.commandName === "cardcollection") {
@@ -500,7 +480,7 @@ client.on("interactionCreate", async interaction => {
     if (interaction.commandName === "collection") {
       const result = await pool.query(
         `
-        SELECT cards.character_name, cards.anime_name, cards.category
+        SELECT cards.character_name, cards.anime_name, cards.category, cards.image_url
         FROM user_cards
         JOIN cards ON user_cards.card_id = cards.id
         WHERE user_cards.user_id = $1
@@ -521,25 +501,23 @@ client.on("interactionCreate", async interaction => {
         )
         .join("\n");
 
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle(`${interaction.user.username}'s Collection`)
-            .setDescription(list)
-            .setColor("Blue")
-        ]
-      });
+      const embed = new EmbedBuilder()
+        .setTitle(`${interaction.user.username}'s Collection`)
+        .setDescription(list)
+        .setColor("Blue");
+
+      if (result.rows[0]?.image_url) {
+        embed.setThumbnail(result.rows[0].image_url);
+      }
+
+      return interaction.reply({ embeds: [embed] });
     }
 
     if (interaction.commandName === "battle") {
       const opponent = interaction.options.getUser("player");
 
-      if (opponent.bot) {
-        return interaction.reply("❌ You cannot battle bots.");
-      }
-
-      if (opponent.id === interaction.user.id) {
-        return interaction.reply("❌ You cannot battle yourself.");
+      if (opponent.bot || opponent.id === interaction.user.id) {
+        return interaction.reply("❌ Invalid opponent.");
       }
 
       const challengerCards = await getUserCards(interaction.user.id);
@@ -580,6 +558,53 @@ client.on("interactionCreate", async interaction => {
         components: [row]
       });
     }
+
+    if (interaction.commandName === "trade") {
+      const receiver = interaction.options.getUser("user");
+
+      if (receiver.bot || receiver.id === interaction.user.id) {
+        return interaction.reply({
+          content: "❌ Invalid trade user.",
+          ephemeral: true
+        });
+      }
+
+      const senderCards = await getUserCards(interaction.user.id);
+
+      if (senderCards.length === 0) {
+        return interaction.reply({
+          content: "❌ You have no cards to trade.",
+          ephemeral: true
+        });
+      }
+
+      const tradeId = `${interaction.user.id}-${receiver.id}-${Date.now()}`;
+
+      pendingTrades.set(tradeId, {
+        senderId: interaction.user.id,
+        receiverId: receiver.id,
+        selectedCard: null
+      });
+
+      const embed = new EmbedBuilder()
+        .setTitle("🤝 Trade Started")
+        .setDescription(
+          `${interaction.user}, select the card you want to offer.\n\n` +
+          `${receiver} can accept or reject after you select.`
+        )
+        .setColor("Green");
+
+      const menu = makeCardSelect(
+        senderCards,
+        `tradeSelect:${tradeId}:${interaction.user.id}`,
+        "Select a card to trade"
+      );
+
+      return interaction.reply({
+        embeds: [embed],
+        components: [new ActionRowBuilder().addComponents(menu)]
+      });
+    }
   }
 
   if (interaction.isButton()) {
@@ -595,6 +620,101 @@ client.on("interactionCreate", async interaction => {
       return interaction.update({
         content: `✅ ${interaction.user} claimed the card!`,
         components: [disabledRow]
+      });
+    }
+
+    if (interaction.customId.startsWith("tradeReject:")) {
+      const tradeId = interaction.customId.split(":")[1];
+      const trade = pendingTrades.get(tradeId);
+
+      if (!trade) {
+        return interaction.reply({
+          content: "❌ This trade expired.",
+          ephemeral: true
+        });
+      }
+
+      if (interaction.user.id !== trade.receiverId) {
+        return interaction.reply({
+          content: "❌ Only the receiver can reject this trade.",
+          ephemeral: true
+        });
+      }
+
+      pendingTrades.delete(tradeId);
+
+      return interaction.update({
+        content: "❌ Trade rejected.",
+        embeds: [],
+        components: []
+      });
+    }
+
+    if (interaction.customId.startsWith("tradeAccept:")) {
+      const tradeId = interaction.customId.split(":")[1];
+      const trade = pendingTrades.get(tradeId);
+
+      if (!trade) {
+        return interaction.reply({
+          content: "❌ This trade expired.",
+          ephemeral: true
+        });
+      }
+
+      if (interaction.user.id !== trade.receiverId) {
+        return interaction.reply({
+          content: "❌ Only the receiver can accept this trade.",
+          ephemeral: true
+        });
+      }
+
+      if (!trade.selectedCard) {
+        return interaction.reply({
+          content: "❌ Sender has not selected a card yet.",
+          ephemeral: true
+        });
+      }
+
+      const check = await pool.query(
+        `
+        SELECT user_cards.id, cards.character_name, cards.anime_name, cards.category
+        FROM user_cards
+        JOIN cards ON user_cards.card_id = cards.id
+        WHERE user_cards.id = $1 AND user_cards.user_id = $2
+        `,
+        [trade.selectedCard.user_card_id, trade.senderId]
+      );
+
+      if (check.rows.length === 0) {
+        pendingTrades.delete(tradeId);
+
+        return interaction.update({
+          content: "❌ Trade failed. The sender no longer owns this card.",
+          embeds: [],
+          components: []
+        });
+      }
+
+      const card = check.rows[0];
+
+      await pool.query(
+        `UPDATE user_cards SET user_id = $1 WHERE id = $2`,
+        [trade.receiverId, trade.selectedCard.user_card_id]
+      );
+
+      pendingTrades.delete(tradeId);
+
+      const embed = new EmbedBuilder()
+        .setTitle("✅ Trade Complete")
+        .setDescription(
+          `<@${trade.senderId}> traded **${card.character_name}** from **${card.anime_name}** to <@${trade.receiverId}>.\n` +
+          `Rank: **${card.category.toUpperCase()}**`
+        )
+        .setColor("Green");
+
+      return interaction.update({
+        embeds: [embed],
+        components: []
       });
     }
 
@@ -624,24 +744,24 @@ client.on("interactionCreate", async interaction => {
         session.page += 1;
       }
 
-      const { embed, totalPages } = await getCardCollectionEmbed(session.category, session.page);
+      const fixed = await getCardCollectionEmbed(session.category, session.page);
 
-      if (session.page >= totalPages) {
-        session.page = totalPages - 1;
+      if (session.page >= fixed.totalPages) {
+        session.page = fixed.totalPages - 1;
       }
 
       cardCollectionSessions.set(sessionId, session);
 
-      const fixed = await getCardCollectionEmbed(session.category, session.page);
+      const finalData = await getCardCollectionEmbed(session.category, session.page);
       const components = getCardCollectionComponents(
         sessionId,
         session.category,
         session.page,
-        fixed.totalPages
+        finalData.totalPages
       );
 
       return interaction.update({
-        embeds: [fixed.embed],
+        embeds: [finalData.embed],
         components
       });
     }
@@ -694,27 +814,17 @@ client.on("interactionCreate", async interaction => {
       const challengerCards = await getUserCards(battle.challengerId);
       const opponentCards = await getUserCards(battle.opponentId);
 
-      const challengerMenu = new StringSelectMenuBuilder()
-        .setCustomId(`selectcard:${battleId}:${battle.challengerId}`)
-        .setPlaceholder("Challenger: choose your card")
-        .addOptions(
-          challengerCards.map(card => ({
-            label: card.character_name.slice(0, 100),
-            description: `${card.anime_name} | ${card.category.toUpperCase()}`.slice(0, 100),
-            value: String(card.user_card_id)
-          }))
-        );
+      const challengerMenu = makeCardSelect(
+        challengerCards,
+        `selectcard:${battleId}:${battle.challengerId}`,
+        "Challenger: choose your card"
+      );
 
-      const opponentMenu = new StringSelectMenuBuilder()
-        .setCustomId(`selectcard:${battleId}:${battle.opponentId}`)
-        .setPlaceholder("Opponent: choose your card")
-        .addOptions(
-          opponentCards.map(card => ({
-            label: card.character_name.slice(0, 100),
-            description: `${card.anime_name} | ${card.category.toUpperCase()}`.slice(0, 100),
-            value: String(card.user_card_id)
-          }))
-        );
+      const opponentMenu = makeCardSelect(
+        opponentCards,
+        `selectcard:${battleId}:${battle.opponentId}`,
+        "Opponent: choose your card"
+      );
 
       return interaction.update({
         content: `⚔️ Battle accepted!\n<@${battle.challengerId}> and <@${battle.opponentId}>, choose your cards.`,
@@ -728,6 +838,81 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.isStringSelectMenu()) {
+    if (interaction.customId.startsWith("tradeSelect:")) {
+      const parts = interaction.customId.split(":");
+      const tradeId = parts[1];
+      const allowedUserId = parts[2];
+
+      if (interaction.user.id !== allowedUserId) {
+        return interaction.reply({
+          content: "❌ This trade menu is not for you.",
+          ephemeral: true
+        });
+      }
+
+      const trade = pendingTrades.get(tradeId);
+
+      if (!trade) {
+        return interaction.reply({
+          content: "❌ This trade expired.",
+          ephemeral: true
+        });
+      }
+
+      const userCardId = interaction.values[0];
+
+      const cardResult = await pool.query(
+        `
+        SELECT user_cards.id AS user_card_id, cards.*
+        FROM user_cards
+        JOIN cards ON user_cards.card_id = cards.id
+        WHERE user_cards.id = $1 AND user_cards.user_id = $2
+        `,
+        [userCardId, interaction.user.id]
+      );
+
+      if (cardResult.rows.length === 0) {
+        return interaction.reply({
+          content: "❌ Card not found.",
+          ephemeral: true
+        });
+      }
+
+      const card = cardResult.rows[0];
+
+      trade.selectedCard = card;
+      pendingTrades.set(tradeId, trade);
+
+      const embed = new EmbedBuilder()
+        .setTitle("🤝 Trade Offer")
+        .setDescription(
+          `<@${trade.senderId}> is offering:\n\n` +
+          `**${card.character_name}**\n` +
+          `Anime: **${card.anime_name}**\n` +
+          `Rank: **${card.category.toUpperCase()}**\n\n` +
+          `<@${trade.receiverId}>, accept or reject this trade.`
+        )
+        .setImage(card.image_url)
+        .setColor("Green");
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`tradeAccept:${tradeId}`)
+          .setLabel("Accept")
+          .setStyle(ButtonStyle.Success),
+
+        new ButtonBuilder()
+          .setCustomId(`tradeReject:${tradeId}`)
+          .setLabel("Reject")
+          .setStyle(ButtonStyle.Danger)
+      );
+
+      return interaction.update({
+        embeds: [embed],
+        components: [row]
+      });
+    }
+
     if (interaction.customId.startsWith("cardCategory:")) {
       const sessionId = interaction.customId.split(":")[1];
       const session = cardCollectionSessions.get(sessionId);
@@ -846,6 +1031,10 @@ client.on("interactionCreate", async interaction => {
             `🏆 Winner: ${winner}`
           )
           .setColor("Purple");
+
+        if (battle.challengerCard.image_url) {
+          resultEmbed.setThumbnail(battle.challengerCard.image_url);
+        }
 
         pendingBattles.delete(battleId);
 
