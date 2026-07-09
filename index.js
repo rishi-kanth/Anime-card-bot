@@ -153,12 +153,50 @@ async function getRandomCard() {
   return result.rows[0];
 }
 
+async function userOwnsCard(userId, cardId) {
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM user_cards
+    WHERE user_id = $1 AND card_id = $2
+    LIMIT 1
+    `,
+    [userId, cardId]
+  );
+
+  return result.rows.length > 0;
+}
+
 async function giveCard(userId, cardId) {
+  const alreadyOwns = await userOwnsCard(userId, cardId);
+
+  if (alreadyOwns) {
+    return false;
+  }
+
   await pool.query(
     `INSERT INTO user_cards (user_id, card_id, obtained_at)
      VALUES ($1, $2, $3)`,
     [userId, cardId, Date.now()]
   );
+
+  return true;
+}
+
+async function getNewRandomCardForUser(userId) {
+  for (let i = 0; i < 20; i++) {
+    const card = await getRandomCard();
+
+    if (!card) return null;
+
+    const owns = await userOwnsCard(userId, card.id);
+
+    if (!owns) {
+      return card;
+    }
+  }
+
+  return null;
 }
 
 async function spawnCard(channel) {
@@ -255,16 +293,8 @@ async function getCardCollectionEmbed(category, page) {
     .setTitle(`🎴 ${category.toUpperCase()} Cards`)
     .setDescription(list)
     .addFields(
-      {
-        name: "📦 Total Cards",
-        value: `${totalCards}`,
-        inline: true
-      },
-      {
-        name: "📄 Page",
-        value: `${page + 1}/${totalPages}`,
-        inline: true
-      }
+      { name: "📦 Total", value: `${totalCards}`, inline: true },
+      { name: "📄 Page", value: `${page + 1}/${totalPages}`, inline: true }
     )
     .setColor("Blue")
     .setFooter({ text: "Use menu to change category • Buttons to change page" });
@@ -451,10 +481,13 @@ client.on("interactionCreate", async interaction => {
         }
       }
 
-      const card = await getRandomCard();
+      const card = await getNewRandomCardForUser(userId);
 
       if (!card) {
-        return interaction.reply("❌ No cards are available yet.");
+        return interaction.reply({
+          content: "❌ You already own all available cards.",
+          ephemeral: true
+        });
       }
 
       await giveCard(userId, card.id);
@@ -613,7 +646,14 @@ client.on("interactionCreate", async interaction => {
     if (interaction.customId.startsWith("claim_")) {
       const cardId = interaction.customId.split("_")[1];
 
-      await giveCard(interaction.user.id, cardId);
+      const added = await giveCard(interaction.user.id, cardId);
+
+      if (!added) {
+        return interaction.reply({
+          content: "❌ You already own this card.",
+          ephemeral: true
+        });
+      }
 
       const disabledRow = new ActionRowBuilder().addComponents(
         ButtonBuilder.from(interaction.component).setDisabled(true)
@@ -674,6 +714,21 @@ client.on("interactionCreate", async interaction => {
         return interaction.reply({
           content: "❌ Sender has not selected a card yet.",
           ephemeral: true
+        });
+      }
+
+      const receiverOwns = await userOwnsCard(
+        trade.receiverId,
+        trade.selectedCard.id
+      );
+
+      if (receiverOwns) {
+        pendingTrades.delete(tradeId);
+
+        return interaction.update({
+          content: "❌ Trade failed. Receiver already owns this card.",
+          embeds: [],
+          components: []
         });
       }
 
