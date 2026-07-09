@@ -242,30 +242,32 @@ async function getCardCollectionEmbed(category, page) {
     [category, CARD_LIMIT, offset]
   );
 
-  let list = "No cards found in this category.";
+  let list = "No cards found.";
 
   if (result.rows.length > 0) {
     list = result.rows.map((card, index) => {
       const number = offset + index + 1;
-
-      return (
-        `**${number}. ${card.character_name}**\n` +
-        `Anime: ${card.anime_name}\n` +
-        `Rank: **${card.category.toUpperCase()}**`
-      );
-    }).join("\n\n");
+      return `**${number}. ${card.character_name}** — ${card.anime_name}`;
+    }).join("\n");
   }
 
   const embed = new EmbedBuilder()
-    .setTitle("🎴 Bot Card Collection")
-    .setDescription(
-      `**Category:** ${category.toUpperCase()}\n` +
-      `**Cards:** ${totalCards}\n` +
-      `**Page:** ${page + 1}/${totalPages}\n\n` +
-      list
+    .setTitle(`🎴 ${category.toUpperCase()} Cards`)
+    .setDescription(list)
+    .addFields(
+      {
+        name: "📦 Total Cards",
+        value: `${totalCards}`,
+        inline: true
+      },
+      {
+        name: "📄 Page",
+        value: `${page + 1}/${totalPages}`,
+        inline: true
+      }
     )
     .setColor("Blue")
-    .setFooter({ text: "Use the category menu and buttons below" });
+    .setFooter({ text: "Use menu to change category • Buttons to change page" });
 
   if (result.rows[0]?.image_url) {
     embed.setThumbnail(result.rows[0].image_url);
